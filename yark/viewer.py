@@ -2,6 +2,7 @@
 
 import json
 import os
+from pathlib import Path
 from flask import (
     Flask,
     render_template,
@@ -22,6 +23,26 @@ from .channel import Channel
 from .video import Note
 
 routes = Blueprint("routes", __name__, template_folder="templates")
+
+_channel_cache: dict[str, tuple[float, Channel]] = {}
+
+
+def _load_channel_cached(name: str) -> Channel:
+    """Loads a channel with mtime-based caching to avoid re-parsing on every request"""
+    path = Path(name)
+    json_path = path / "yark.json"
+    mtime = json_path.stat().st_mtime if json_path.exists() else 0.0
+    cached = _channel_cache.get(name)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    channel = Channel.load(name)
+    _channel_cache[name] = (mtime, channel)
+    return channel
+
+
+def _invalidate_channel_cache(name: str):
+    """Removes a channel from cache so next request reloads from disk"""
+    _channel_cache.pop(name, None)
 
 
 @routes.route("/", methods=["POST", "GET"])
@@ -54,7 +75,7 @@ def channel(name, kind):
         return redirect(url_for("routes.index", error="Video kind not recognised"))
 
     try:
-        channel = Channel.load(name)
+        channel = _load_channel_cached(name)
         ldir = os.listdir(channel.path / "videos")
         return render_template(
             "channel.html", title=name, channel=channel, name=name, ldir=ldir
@@ -77,7 +98,7 @@ def video(name, kind, id):
 
     try:
         # Get information
-        channel = Channel.load(name)
+        channel = _load_channel_cached(name)
         video = channel.search(id)
 
         # Return video webpage
@@ -107,11 +128,10 @@ def video(name, kind, id):
             body = new["body"] if "body" in new else None
             note = Note.new(video, timestamp, title, body)
 
-            # Save new note
             video.notes.append(note)
             video.channel.commit()
+            _invalidate_channel_cache(name)
 
-            # Return
             return note._to_dict(), 200
 
         # Update existing note
@@ -133,8 +153,8 @@ def video(name, kind, id):
             if "body" in update:
                 note.body = update["body"]
             video.channel.commit()
+            _invalidate_channel_cache(name)
 
-            # Return
             return "Updated", 200
 
         # Delete existing note
@@ -151,8 +171,8 @@ def video(name, kind, id):
                     filtered_notes.append(note)
             video.notes = filtered_notes
             video.channel.commit()
+            _invalidate_channel_cache(name)
 
-            # Return
             return "Deleted", 200
 
     # Archive not found

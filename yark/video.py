@@ -37,8 +37,8 @@ class Video:
         video.channel = channel
         video.id = entry["id"]
         video.uploaded = _decode_date_yt(entry["upload_date"])
-        video.width = entry["width"]
-        video.height = entry["height"]
+        video.width = entry.get("width")
+        video.height = entry.get("height")
         video.title = Element.new(video, entry["title"])
         video.description = Element.new(video, entry["description"])
         video.views = Element.new(video, entry["view_count"])
@@ -75,16 +75,20 @@ class Video:
         # Runtime-only
         self.known_not_deleted = True
 
+    _VIDEO_EXTENSIONS = {".mkv", ".mp4", ".webm", ".flv", ".avi", ".mov", ".m4v"}
+
     def filename(self) -> Optional[str]:
         """Returns the filename for the downloaded video, if any"""
         videos = self.channel.path / "videos"
         for file in videos.iterdir():
-            if file.stem == self.id and file.suffix != ".part":
+            if file.stem == self.id and file.suffix in self._VIDEO_EXTENSIONS:
                 return file.name
         return None
 
     def downloaded(self) -> bool:
         """Checks if this video has been downloaded"""
+        if self.channel._downloaded_cache is not None:
+            return self.id in self.channel._downloaded_cache
         return self.filename() is not None
 
     def updated(self) -> bool:
@@ -226,7 +230,7 @@ class Element:
 
     def current(self):
         """Returns most recent element"""
-        return self.inner[list(self.inner.keys())[-1]]
+        return self.inner[next(reversed(self.inner))]
 
     def changed(self) -> bool:
         """Checks if the value has ever been modified from it's original state"""
@@ -268,29 +272,33 @@ class Thumbnail:
     video: Video
     id: str
     path: Path
+    source_url: Optional[str]
 
     @staticmethod
     def new(url: str, video: Video):
         """Pulls a new thumbnail from YouTube and saves"""
-        # Details
+        current_thumb = None
+        if hasattr(video, "thumbnail") and hasattr(video.thumbnail, "current"):
+            current_thumb = video.thumbnail.current()
+        if current_thumb is not None and hasattr(current_thumb, "source_url") and current_thumb.source_url == url:
+            return current_thumb
+
         thumbnail = Thumbnail()
         thumbnail.video = video
+        thumbnail.source_url = url
 
-        # Get image and calculate it's hash
         image = requests.get(url).content
         thumbnail.id = hashlib.blake2b(
             image, digest_size=20, usedforsecurity=False
         ).hexdigest()
 
-        # Calculate paths
         thumbnails = thumbnail._path()
         thumbnail.path = thumbnails / f"{thumbnail.id}.webp"
 
-        # Save to collection
-        with open(thumbnail.path, "wb+") as file:
-            file.write(image)
+        if not thumbnail.path.exists():
+            with open(thumbnail.path, "wb+") as file:
+                file.write(image)
 
-        # Return
         return thumbnail
 
     @staticmethod
@@ -299,6 +307,7 @@ class Thumbnail:
         thumbnail = Thumbnail()
         thumbnail.id = id
         thumbnail.video = video
+        thumbnail.source_url = None
         thumbnail.path = thumbnail._path() / f"{thumbnail.id}.webp"
         return thumbnail
 

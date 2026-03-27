@@ -6,7 +6,7 @@ import sys
 import threading
 import webbrowser
 from .errors import _err_msg, ArchiveNotFoundException
-from .channel import Channel, DownloadConfig
+from .channel import Channel, DownloadConfig, request_shutdown
 from .viewer import viewer
 
 HELP = f"yark [options]\n\n  YouTube archiving made simple.\n\nOptions:\n  new [name] [url]         Creates new archive with name and channel url\n  refresh [name] [args?]   Refreshes/downloads archive with optional config\n  view [name?]             Launches offline archive viewer website\n  report [name]            Provides a report on the most interesting changes\n\nExample:\n  $ yark new owez https://www.youtube.com/channel/UCSMdm6bUYIBN0KfS2CVuEPA\n  $ yark refresh owez\n  $ yark view owez"
@@ -54,7 +54,7 @@ def _cli():
         if len(args) == 2 and args[1] == "--help":
             # NOTE: if these get more complex, separate into something like "basic config" and "advanced config"
             print(
-                f"yark refresh [name] [args?]\n\n  Refreshes/downloads archive with optional configuration.\n  If a maximum is set, unset categories won't be downloaded\n\nArguments:\n  --videos=[max]        Maximum recent videos to download\n  --shorts=[max]        Maximum recent shorts to download\n  --livestreams=[max]   Maximum recent livestreams to download\n  --skip-metadata       Skips downloading metadata\n  --skip-download       Skips downloading content\n  --format=[str]        Downloads using custom yt-dlp format for advanced users\n\n Example:\n  $ yark refresh demo\n  $ yark refresh demo --videos=5\n  $ yark refresh demo --shorts=2 --livestreams=25\n  $ yark refresh demo --skip-download"
+                f"yark refresh [name] [args?]\n\n  Refreshes/downloads archive with optional configuration.\n  If a maximum is set, unset categories won't be downloaded\n\nArguments:\n  --videos=[max]        Maximum recent videos to download\n  --shorts=[max]        Maximum recent shorts to download\n  --livestreams=[max]   Maximum recent livestreams to download\n  --skip-metadata       Skips downloading metadata\n  --skip-download       Skips downloading content\n  --format=[str]        Downloads using custom yt-dlp format for advanced users\n  --max-age=[hours]     Use cached metadata if less than N hours old (default 24, 0 to force refresh)\n\n Example:\n  $ yark refresh demo\n  $ yark refresh demo --videos=5\n  $ yark refresh demo --shorts=2 --livestreams=25\n  $ yark refresh demo --skip-download\n  $ yark refresh demo --max-age=0"
             )
             sys.exit(0)
 
@@ -108,6 +108,17 @@ def _cli():
                 elif config_arg.startswith("--format="):
                     config.format = parse_value(config_arg)
 
+                # Metadata cache max age
+                elif config_arg.startswith("--max-age="):
+                    try:
+                        config.max_age = float(parse_value(config_arg))
+                    except ValueError:
+                        print(HELP, file=sys.stderr)
+                        _err_msg(
+                            f"\nError: The value '{parse_value(config_arg)}' isn't a valid number of hours"
+                        )
+                        sys.exit(1)
+
                 # Unknown argument
                 else:
                     print(HELP, file=sys.stderr)
@@ -125,13 +136,22 @@ def _cli():
             if config.skip_metadata:
                 print("Skipping metadata download..")
             else:
-                channel.metadata()
+                channel.metadata(config)
                 channel.commit()  # NOTE: Do it here no matter, because it's metadata. Downloads do not modify the archive
             if config.skip_download:
                 print("Skipping videos/livestreams/shorts download..")
             else:
                 channel.download(config)
             channel.reporter.print()
+        except KeyboardInterrupt:
+            request_shutdown()
+            print(
+                "\n"
+                + Fore.YELLOW
+                + "Interrupted, shutting down gracefully.."
+                + Fore.RESET
+            )
+            sys.exit(130)
         except ArchiveNotFoundException:
             _err_archive_not_found()
 
@@ -174,26 +194,23 @@ def _cli():
         def launch():
             """Launches viewer"""
             app = viewer()
-            threading.Thread(target=lambda: app.run(host=host, port=port)).run()
+            app.run(host=host, port=port)
 
-        # Start on channel name
         if len(args) > 1:
-            # Get name
             channel = args[1]
 
-            # Jank archive check
             if not Path(channel).exists():
                 _err_archive_not_found()
 
-            # Launch and start browser
             print(f"Starting viewer for {channel}..")
-            webbrowser.open(f"http://127.0.0.1:7667/channel/{channel}/videos")
+            url = f"http://{host or '127.0.0.1'}:{port}/channel/{channel}/videos"
+            threading.Timer(1.0, webbrowser.open, args=[url]).start()
             launch()
 
-        # Start on channel finder
         else:
             print("Starting viewer..")
-            webbrowser.open(f"http://127.0.0.1:7667/")
+            url = f"http://{host or '127.0.0.1'}:{port}/"
+            threading.Timer(1.0, webbrowser.open, args=[url]).start()
             launch()
 
     # Report

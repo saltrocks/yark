@@ -5,6 +5,7 @@ from datetime import datetime
 import json
 from pathlib import Path
 import time
+import threading
 from yt_dlp import YoutubeDL, DownloadError  # type: ignore
 from colorama import Style, Fore
 import sys
@@ -12,10 +13,25 @@ from .reporter import Reporter
 from .errors import ArchiveNotFoundException, _err_msg, VideoNotFoundException
 from .video import Video, Element
 from typing import Any
-import time
 from progress.spinner import PieSpinner
-from concurrent.futures import ThreadPoolExecutor
-import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+MAX_METADATA_WORKERS = 64
+"""Maximum number of concurrent metadata fetches"""
+
+MAX_DOWNLOAD_WORKERS = 32
+"""Maximum number of concurrent video downloads (each uses 128 fragment threads)"""
+
+_shutdown_event = threading.Event()
+
+
+def request_shutdown():
+    """Signal all workers to stop gracefully"""
+    _shutdown_event.set()
+
+
+def is_shutting_down() -> bool:
+    return _shutdown_event.is_set()
 
 ARCHIVE_COMPAT = 3
 """
@@ -43,6 +59,7 @@ class DownloadConfig:
     skip_download: bool
     skip_metadata: bool
     format: Optional[str]
+    max_age: Optional[float]
 
     def __init__(self) -> None:
         self.max_videos = None
@@ -51,6 +68,7 @@ class DownloadConfig:
         self.skip_download = False
         self.skip_metadata = False
         self.format = None
+        self.max_age = 24.0
 
     def submit(self):
         """Submits configuration, this has the effect of normalising maximums to 0 properly"""
@@ -78,43 +96,47 @@ class DownloadConfig:
             self.skip_download = True
 
 
+class DownloadProgress:
+    """Thread-safe tracker for concurrent download progress"""
+
+    def __init__(self, total: int):
+        self._lock = threading.Lock()
+        self._total = total
+        self._active = 0
+        self._completed = 0
+
+    def start(self):
+        with self._lock:
+            self._active += 1
+            self._print()
+
+    def finish(self):
+        with self._lock:
+            self._active -= 1
+            self._completed += 1
+            self._print()
+
+    def _print(self):
+        print(
+            Style.DIM
+            + f"  • Downloading: {self._active} active, {self._completed}/{self._total} completed"
+            + "        "
+            + Style.NORMAL,
+            end="\r",
+        )
+
+
 class VideoLogger:
-    @staticmethod
-    def downloading(d):
-        """Progress hook for video downloading"""
-        # Get video's id
-        id = d["info_dict"]["id"]
-
-        # Downloading percent
-        if d["status"] == "downloading":
-            percent = d["_percent_str"].strip()
-            print(
-                Style.DIM
-                + f"  • Downloading {id}, at {percent}"
-                + Style.DIM
-                + "..                "
-                + Style.NORMAL,
-                end="\r",
-            )
-
-        # Finished a video's download
-        elif d["status"] == "finished":
-            print(Style.DIM + f"  • Downloaded {id}                " + Style.NORMAL)
-
     def debug(self, msg):
-        """Debug log messages, ignored"""
         pass
 
     def info(self, msg):
-        """Info log messages ignored"""
         pass
 
     def warning(self, msg):
-        """Warning log messages ignored"""
         pass
 
     def error(self, msg):
-        """Error log messages"""
         pass
 
 
@@ -126,11 +148,12 @@ class Channel:
     livestreams: list[Video]
     shorts: list[Video]
     reporter: Reporter
+    _video_index: dict[str, Video]
+    _downloaded_cache: Optional[set[str]]
 
     @staticmethod
     def new(path: Path, url: str) -> Channel:
         """Creates a new channel"""
-        # Details
         print("Creating new channel..")
         channel = Channel()
         channel.path = Path(path)
@@ -140,8 +163,9 @@ class Channel:
         channel.livestreams = []
         channel.shorts = []
         channel.reporter = Reporter(channel)
+        channel._video_index = {}
+        channel._downloaded_cache = None
 
-        # Commit and return
         channel.commit()
         return channel
 
@@ -161,8 +185,8 @@ class Channel:
         if not path.exists():
             raise ArchiveNotFoundException("Archive doesn't exist")
 
-        # Load config
-        encoded = json.load(open(path / "yark.json", "r"))
+        with open(path / "yark.json", "r") as f:
+            encoded = json.load(f)
 
         # Check version before fully decoding and exit if wrong
         archive_version = encoded["version"]
@@ -174,133 +198,95 @@ class Channel:
         # Decode and return
         return Channel._from_dict(encoded, path)
 
-    def metadata(self):
+    def metadata(self, config: Optional[DownloadConfig] = None):
         """Queries YouTube for all channel metadata to refresh known videos"""
-        # Print loading progress at the start without loading indicator so theres always a print
-        msg = "Downloading metadata.."
-        print(msg, end="\r")
+        cache_path = self.path / "metadata_cache.json"
+        max_age = config.max_age if config is not None else 24.0
 
-        # Download metadata and give the user a spinner bar
-        with ThreadPoolExecutor() as ex:
-            # Make future for downloading metadata
-            future = ex.submit(self._download_metadata)
+        if max_age is not None and cache_path.exists():
+            cache_stat = cache_path.stat()
+            age_hours = (time.time() - cache_stat.st_mtime) / 3600
+            if age_hours < max_age:
+                print(f"Using cached metadata ({age_hours:.1f}h old, max {max_age}h)..")
+                with open(cache_path, "r") as f:
+                    res = json.load(f)
+                self._parse_metadata(res)
+                self._save_descriptions()
+                return
 
-            # Start spinning
-            with PieSpinner(f"{msg} ") as bar:
-                # Don't show bar for 2 seconds but check if future is done
-                no_bar_time = time.time() + 2
-                while time.time() < no_bar_time:
-                    if future.done():
-                        break
-                    time.sleep(0.25)
+        print("Downloading metadata..")
+        res = self._download_metadata()
+        print()
 
-                # Show loading spinner
-                while not future.done():
-                    bar.next()
-                    time.sleep(0.075)
+        with open(cache_path, "w") as file:
+            json.dump(res, file)
 
-            # Get result from thread now that it's finished
-            res = future.result()
-
-        # Uncomment for saving big dumps for testing
-        # with open(self.path / "dump.json", "w+") as file:
-        #     json.dump(res, file)
-
-        # Uncomment for loading big dumps for testing
-        # res = json.load(open(self.path / "dump.json", "r"))
-
-        # Parse downloaded metadata
         self._parse_metadata(res)
+        self._save_descriptions()
 
     def _download_metadata(self) -> dict[str, Any]:
         """Downloads metadata dict and returns for further parsing"""
-        # Construct downloader
-        settings = {
-            # Centralized logging system; makes output fully quiet
-            "logger": VideoLogger(),
-            # Skip downloading pending livestreams (#60 <https://github.com/Owez/yark/issues/60>)
-            "ignore_no_formats_error": True,
-            # Concurrent fragment downloading for increased resilience (#109 <https://github.com/Owez/yark/issues/109>)
-            "concurrent_fragment_downloads": 8,
-            # First download "flat", then extract_info for each video, to support large channels/playlists (#71 <https://github.com/Owez/yark/issues/71>)
-            "extract_flat":True
-        }
+        flat_settings = _metadata_settings(flat=True)
+        video_settings = _metadata_settings(flat=False)
 
-        # Get response and snip it
-        with YoutubeDL(settings) as ydl:
-            # first extract the "flat" metadata, which does not download the metadata for all the videos
+        res: Optional[dict[str, Any]] = None
+        with YoutubeDL(flat_settings) as ydl:
             for i in range(3):
                 try:
-                    res: dict[str, Any] = ydl.extract_info(self.url, download=False)
+                    res = ydl.extract_info(self.url, download=False)
                     break
                 except Exception as exception:
-                    # Report error
                     retrying = i != 2
                     _err_dl("metadata", exception, retrying)
-
-                    # Print retrying message
                     if retrying:
                         print(
                             Style.DIM
                             + f"  • Retrying metadata download.."
                             + Style.RESET_ALL
-                        )  # TODO: compat with loading bar
+                        )
 
-            # go through the "flat" metadata and download the metadata for each video
-            for index in range(len(res["entries"])):
-                if res["entries"][index]["_type"] == "playlist":
-                    playlist = res["entries"][index]
-                    for list_index in range(len(playlist["entries"])):
-                        url = playlist["entries"][list_index]["url"]
-                        for i in range(3):
-                            try:
-                                entry = ydl.extract_info(url, download=False)
-                                if len(entry["formats"]) == 0:
-                                    ydl = YoutubeDL(settings)
-                                    entry = ydl.extract_info(url, download=False)
+        if res is None:
+            _err_msg("Failed to download metadata after all retries", True)
+            sys.exit(1)
 
-                                playlist["entries"][list_index] = entry
-                                break
-                            except Exception as exception:
-                                # Report error
-                                retrying = i != 2
-                                _err_dl("metadata", exception, retrying)
+        jobs: list[tuple] = []
+        for index in range(len(res["entries"])):
+            if res["entries"][index]["_type"] == "playlist":
+                playlist = res["entries"][index]
+                for list_index in range(len(playlist["entries"])):
+                    url = playlist["entries"][list_index]["url"]
+                    jobs.append(("playlist", index, list_index, url))
+            elif res["entries"][index]["_type"] == "url":
+                url = res["entries"][index]["url"]
+                jobs.append(("url", index, None, url))
 
-                                # Print retrying message
-                                if retrying:
-                                    print(
-                                        Style.DIM
-                                        + f"  • Retrying metadata download.."
-                                        + Style.RESET_ALL
-                                    )  # TODO: compat with loading bar
+        progress = DownloadProgress(len(jobs))
 
+        with ThreadPoolExecutor(max_workers=MAX_METADATA_WORKERS) as executor:
+            futures = {
+                executor.submit(_fetch_single_metadata, video_settings.copy(), url, progress): (kind, idx, sub_idx)
+                for kind, idx, sub_idx, url in jobs
+            }
+            try:
+                for future in as_completed(futures):
+                    if _shutdown_event.is_set():
+                        break
+                    kind, idx, sub_idx = futures[future]
+                    entry = future.result()
+                    if entry is None:
+                        continue
+                    if kind == "playlist":
+                        res["entries"][idx]["entries"][sub_idx] = entry
+                    else:
+                        res["entries"][idx] = entry
+            except KeyboardInterrupt:
+                _shutdown_event.set()
+                for f in futures:
+                    f.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
 
-                elif res["entries"][index]["_type"] == "url":
-                    url = res["entries"][index]["url"] 
-                    for i in range(3):
-                        try:
-                            entry = ydl.extract_info(url, download=False)
-                            # if video didn't download formats, open a new downloader and try again
-                            if len(entry["formats"]) == 0:
-                                ydl = YoutubeDL(settings)
-                                entry = ydl.extract_info(url, download=False)
-
-                            res["entries"][index] = entry
-                            break
-                        except Exception as exception:
-                            # Report error
-                            retrying = i != 2
-                            _err_dl("metadata", exception, retrying)
-
-                            # Print retrying message
-                            if retrying:
-                                print(
-                                    Style.DIM
-                                    + f"  • Retrying metadata download.."
-                                    + Style.RESET_ALL
-                                )  # TODO: compat with loading bar
-
-            return res
+        return res
 
     def _parse_metadata(self, res: dict[str, Any]):
         """Parses entirety of downloaded metadata"""
@@ -336,106 +322,104 @@ class Channel:
 
     def download(self, config: DownloadConfig):
         """Downloads all videos which haven't already been downloaded"""
-        # Clean out old part files
+        self._build_download_cache()
         self._clean_parts()
 
-        # Create settings for the downloader
         settings = {
-            # Set the output path
             "outtmpl": f"{self.path}/videos/%(id)s.%(ext)s",
-            # Centralized logger hook for ignoring all stdout
             "logger": VideoLogger(),
-            # Logger hook for download progress
-            "progress_hooks": [VideoLogger.downloading],
+            "format": config.format if config.format is not None else "bestvideo+bestaudio/best",
+            "merge_output_format": "mkv",
+            "concurrent_fragment_downloads": 128,
+            "retries": 10,
+            "fragment_retries": 10,
+            "socket_timeout": 60,
+            "writesubtitles": True,
+            "subtitleslangs": ["all"],
+            "writeinfojson": True,
+            "writethumbnail": False,
+            "postprocessors": [{"key": "FFmpegEmbedSubtitle"}],
         }
-        if config.format is not None:
-            settings["format"] = config.format
 
-        # Attach to the downloader
-        with YoutubeDL(settings) as ydl:
-            # Retry downloading 5 times in total for all videos
-            for i in range(5):
-                # Try to curate a list and download videos on it
-                try:
-                    # Curate list of non-downloaded videos
-                    not_downloaded = self._curate(config)
+        for i in range(5):
+            try:
+                not_downloaded = self._curate(config)
 
-                    # Stop if there's nothing to download
-                    if len(not_downloaded) == 0:
-                        break
+                if len(not_downloaded) == 0:
+                    break
 
-                    # Print curated if this is the first time
-                    if i == 0:
-                        fmt_num = (
-                            "a new video"
-                            if len(not_downloaded) == 1
-                            else f"{len(not_downloaded)} new videos"
-                        )
-                        print(f"Downloading {fmt_num}..")
+                if i == 0:
+                    fmt_num = (
+                        "a new video"
+                        if len(not_downloaded) == 1
+                        else f"{len(not_downloaded)} new videos"
+                    )
+                    print(f"Downloading {fmt_num}..")
 
-                    # Continuously try to download after private/deleted videos are found
-                    # This block gives the downloader all the curated videos and skips/reports deleted videos by filtering their exceptions
-                    while True:
-                        # Download from curated list then exit the optimistic loop
-                        try:
-                            urls = [video.url() for video in not_downloaded]
-                            ydl.download(urls)
-                            break
+                progress = DownloadProgress(len(not_downloaded))
 
-                        # Special handling for private/deleted videos which are archived, if not we raise again
-                        except DownloadError as exception:
-                            # Video is privated or deleted
-                            if (
-                                "Private video" in exception.msg
-                                or "This video has been removed by the uploader"
-                                in exception.msg
-                            ):
-                                # Skip video from curated and get it as a return
-                                not_downloaded, video = _skip_video(
-                                    not_downloaded, "deleted"
+                with ThreadPoolExecutor(max_workers=MAX_DOWNLOAD_WORKERS) as executor:
+                    futures = {
+                        executor.submit(_download_single_video, settings.copy(), video, progress): video
+                        for video in not_downloaded
+                    }
+                    try:
+                        for future in as_completed(futures):
+                            if _shutdown_event.is_set():
+                                break
+                            status, video = future.result()
+                            if status == "cancelled":
+                                continue
+                            elif status == "private":
+                                print(
+                                    "\n"
+                                    + Style.DIM
+                                    + f"  • Skipping {video.id} (deleted)"
+                                    + Style.NORMAL,
+                                    end="",
                                 )
-
-                                # If this is a new occurrence then set it & report
-                                # This will only happen if its deleted after getting metadata, like in a dry run
                                 if video.deleted.current() == False:
                                     self.reporter.deleted.append(video)
                                     video.deleted.update(None, True)
-
-                            # User hasn't got ffmpeg installed and youtube hasn't got format 22
-                            # NOTE: see #55 <https://github.com/Owez/yark/issues/55> to learn more
-                            # NOTE: sadly yt-dlp doesn't let us access yt_dlp.utils.ContentTooShortError so we check msg
-                            elif " bytes, expected " in exception.msg:
-                                # Skip video from curated
-                                not_downloaded, _ = _skip_video(
-                                    not_downloaded,
-                                    "no format found; please download ffmpeg!",
-                                    True,
+                            elif status == "no_format":
+                                print(
+                                    "\n"
+                                    + Fore.YELLOW
+                                    + f"  • Skipping {video.id} (no downloadable format available)"
+                                    + Fore.RESET,
+                                    end="",
+                                    file=sys.stderr,
                                 )
+                            elif status == "network_error":
+                                print(
+                                    "\n"
+                                    + Fore.YELLOW
+                                    + f"  • Skipping {video.id} (network error after retries)"
+                                    + Fore.RESET,
+                                    end="",
+                                    file=sys.stderr,
+                                )
+                    except KeyboardInterrupt:
+                        _shutdown_event.set()
+                        for f in futures:
+                            f.cancel()
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        raise
 
-                            # Nevermind, normal exception
-                            else:
-                                raise exception
+                print()
 
-                    # Stop if we've got them all
-                    break
+                break
 
-                # Report error and retry/stop
-                except Exception as exception:
-                    # Get around carriage return
-                    if i == 0:
-                        print()
-
-                    # Report error
-                    _err_dl("videos", exception, i != 4)
+            except Exception as exception:
+                if i == 0:
+                    print()
+                _err_dl("videos", exception, i != 4)
 
     def search(self, id: str):
         """Searches channel for a video with the corresponding `id` and returns"""
-        # Search
-        for video in self.videos:
-            if video.id == id:
-                return video
-
-        # Raise exception if it's not found
+        video = self._video_index.get(id)
+        if video is not None:
+            return video
         raise VideoNotFoundException(f"Couldn't find {id} inside archive")
 
     def _curate(self, config: DownloadConfig) -> list[Video]:
@@ -516,29 +500,43 @@ class Channel:
 
     def _parse_metadata_videos_comp(self, i: list, bucket: list):
         """Computes the actual parsing for `_parse_metadata_videos` without outputting what's happening"""
+        bucket_index = {v.id: v for v in bucket}
         for entry in i:
-            # Skip video if there's no formats available; happens with upcoming videos/livestreams
             if "formats" not in entry or len(entry["formats"]) == 0:
                 continue
 
-            # Updated intra-loop marker
-            updated = False
-
-            # Update video if it exists
-            for video in bucket:
-                if video.id == entry["id"]:
-                    video.update(entry)
-                    updated = True
-                    break
-
-            # Add new video if not
-            if not updated:
+            existing = bucket_index.get(entry["id"])
+            if existing is not None:
+                existing.update(entry)
+            else:
                 video = Video.new(entry, self)
                 bucket.append(video)
+                bucket_index[video.id] = video
+                self._video_index[video.id] = video
                 self.reporter.added.append(video)
 
-        # Sort videos by newest
         bucket.sort(reverse=True)
+
+    def _save_descriptions(self):
+        """Saves current description for each video as a text file"""
+        desc_dir = self.path / "descriptions"
+        if not desc_dir.exists():
+            desc_dir.mkdir()
+        for bucket in [self.videos, self.livestreams, self.shorts]:
+            for video in bucket:
+                desc = video.description.current()
+                if desc is None:
+                    continue
+                desc_path = desc_dir / f"{video.id}.txt"
+                if desc_path.exists():
+                    try:
+                        existing = desc_path.read_text(encoding="utf-8")
+                        if existing == desc:
+                            continue
+                    except Exception:
+                        pass
+                with open(desc_path, "w", encoding="utf-8") as f:
+                    f.write(desc)
 
     def _report_deleted(self, videos: list):
         """Goes through a video category to report & save those which where not marked in the metadata as deleted if they're not already known to be deleted"""
@@ -547,18 +545,28 @@ class Channel:
                 self.reporter.deleted.append(video)
                 video.deleted.update(None, True)
 
+    def _build_download_cache(self):
+        """Builds a set of downloaded video stems for O(1) lookups"""
+        videos_dir = self.path / "videos"
+        if not videos_dir.exists():
+            self._downloaded_cache = set()
+            return
+        self._downloaded_cache = {
+            f.stem for f in videos_dir.iterdir()
+            if f.suffix in Video._VIDEO_EXTENSIONS
+        }
+
     def _clean_parts(self):
         """Cleans old temporary `.part` files which where stopped during download if present"""
-        # Make a bucket for found files
-        deletion_bucket: list[Path] = []
-
-        # Scan through and find part files
         videos = self.path / "videos"
+        if not videos.exists():
+            return
+
+        deletion_bucket: list[Path] = []
         for file in videos.iterdir():
             if file.suffix == ".part" or file.suffix == ".ytdl":
                 deletion_bucket.append(file)
 
-        # Print and delete if there are part files present
         if len(deletion_bucket) != 0:
             print("Cleaning out previous temporary files..")
             for file in deletion_bucket:
@@ -590,6 +598,7 @@ class Channel:
         channel.version = encoded["version"]
         channel.url = encoded["url"]
         channel.reporter = Reporter(channel)
+        channel._downloaded_cache = None
         channel.videos = [
             Video._from_dict(video, channel) for video in encoded["videos"]
         ]
@@ -599,6 +608,13 @@ class Channel:
         channel.shorts = [
             Video._from_dict(video, channel) for video in encoded["shorts"]
         ]
+        channel._video_index = {}
+        for v in channel.videos:
+            channel._video_index[v.id] = v
+        for v in channel.livestreams:
+            channel._video_index[v.id] = v
+        for v in channel.shorts:
+            channel._video_index[v.id] = v
         return channel
 
     def _to_dict(self) -> dict:
@@ -613,6 +629,93 @@ class Channel:
 
     def __repr__(self) -> str:
         return self.path.name
+
+
+def _metadata_settings(flat: bool = False) -> dict:
+    """Returns yt-dlp settings for metadata downloading"""
+    settings = {
+        "logger": VideoLogger(),
+        "ignore_no_formats_error": True,
+    }
+    if flat:
+        settings["extract_flat"] = True
+    return settings
+
+
+def _fetch_single_metadata(settings: dict, url: str, progress: Optional[DownloadProgress] = None) -> Any:
+    """Fetches metadata for a single video URL with retries; each call uses its own YoutubeDL instance for thread safety"""
+    if _shutdown_event.is_set():
+        return None
+    if progress:
+        progress.start()
+    try:
+        for i in range(3):
+            if _shutdown_event.is_set():
+                return None
+            try:
+                with YoutubeDL(settings) as ydl:
+                    entry = ydl.extract_info(url, download=False)
+                    if entry.get("formats") is not None and len(entry["formats"]) == 0:
+                        with YoutubeDL(settings) as ydl2:
+                            entry = ydl2.extract_info(url, download=False)
+                    return entry
+            except Exception as exception:
+                if _shutdown_event.is_set():
+                    return None
+                retrying = i != 2
+                _err_dl("metadata", exception, retrying)
+                if retrying:
+                    print(
+                        Style.DIM
+                        + f"  • Retrying metadata download.."
+                        + Style.RESET_ALL
+                    )
+        return None
+    finally:
+        if progress:
+            progress.finish()
+
+
+def _download_single_video(settings: dict, video, progress: DownloadProgress) -> tuple[str, Any]:
+    """Downloads a single video file; returns (status, video) where status is 'ok', 'private', 'no_format', 'cancelled', or 'error'"""
+    if _shutdown_event.is_set():
+        return ("cancelled", video)
+    progress.start()
+    try:
+        for attempt in range(3):
+            if _shutdown_event.is_set():
+                return ("cancelled", video)
+            try:
+                with YoutubeDL(settings) as ydl:
+                    ydl.download([video.url()])
+                return ("ok", video)
+            except DownloadError as exception:
+                if _shutdown_event.is_set():
+                    return ("cancelled", video)
+                if (
+                    "Private video" in exception.msg
+                    or "This video has been removed by the uploader" in exception.msg
+                ):
+                    return ("private", video)
+                elif "Requested format is not available" in exception.msg:
+                    return ("no_format", video)
+                elif (
+                    "timed out" in exception.msg
+                    or "bytes read" in exception.msg
+                    or "Connection reset" in exception.msg
+                    or "HTTPSConnectionPool" in exception.msg
+                    or "Read timed out" in exception.msg
+                    or "incomplete read" in exception.msg.lower()
+                ):
+                    if attempt < 2:
+                        time.sleep(5 * (attempt + 1))
+                        continue
+                    return ("network_error", video)
+                else:
+                    raise
+        return ("no_format", video)
+    finally:
+        progress.finish()
 
 
 def _skip_video(
